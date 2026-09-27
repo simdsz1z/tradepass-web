@@ -9,13 +9,17 @@
  *   - error:    last error to display
  *   - sessionId: persistent UUID stored in localStorage
  *
+ * The user can also paste their own MiniMax API key via the settings panel
+ * (gear icon in the header). When set, that key is sent with each request
+ * and used server-side instead of the env var.
+ *
  * On mount:
  *   - Generate sessionId (or restore from localStorage)
  *   - Fetch prior messages from /api/sessions/:id
  *
  * On submit:
  *   - Append the user's message optimistically
- *   - POST /api/chat
+ *   - POST /api/chat (with apiKey + baseUrl if set)
  *   - Append assistant reply (or show error)
  *
  * On clear:
@@ -28,6 +32,7 @@ import type { ChatMessage, ChatResponse } from "@/lib/types";
 import MessageBubble from "./MessageBubble";
 import ExampleChips from "./ExampleChips";
 import Disclaimer from "./Disclaimer";
+import SettingsPanel from "./SettingsPanel";
 
 const EXAMPLES: string[] = [
   "I want to export 200kg of processed avocado oil from Kenya to Uganda",
@@ -114,10 +119,17 @@ export default function Chat() {
       setPending(true);
 
       try {
+        const userKey = typeof window !== "undefined" ? localStorage.getItem("tradepass.minimaxKey") ?? undefined : undefined;
+        const userBase = typeof window !== "undefined" ? localStorage.getItem("tradepass.minimaxBaseUrl") ?? undefined : undefined;
         const r = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ sessionId, question: q }),
+          body: JSON.stringify({
+            sessionId,
+            question: q,
+            ...(userKey ? { apiKey: userKey } : {}),
+            ...(userBase ? { baseUrl: userBase } : {}),
+          }),
         });
         const j: ChatResponse = await r.json();
         if (j.ok) {
@@ -153,7 +165,7 @@ export default function Chat() {
   return (
     <div className="flex h-full flex-col">
       {/* Header */}
-      <header className="flex items-center justify-between border-b border-stone-200 bg-white/70 px-4 py-3 backdrop-blur sm:px-6">
+      <header className="relative flex items-center justify-between border-b border-stone-200 bg-white/70 px-4 py-3 backdrop-blur sm:px-6">
         <div className="flex items-center gap-3">
           <div className="flex h-9 w-9 items-center justify-center rounded-full bg-gradient-to-br from-amber-500 to-emerald-600 text-lg text-white shadow-sm">
             🌍
@@ -176,6 +188,7 @@ export default function Chat() {
               {sourceCount} sources
             </span>
           )}
+          <SettingsPanel onSaved={() => setMessages((m) => [...m])} />
           <button
             type="button"
             onClick={clear}

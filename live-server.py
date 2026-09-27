@@ -1,7 +1,7 @@
 """
 Live preview server for TradePass.
 
-Stack: Python stdlib only (+ google-genai for live LLM calls).
+Stack: Python stdlib + openai SDK (calls MiniMax's OpenAI-compatible API).
 
 Pages:
   /        — landing page (project intro)
@@ -18,12 +18,14 @@ API:
   GET  /api/sources                                                    → { sources }
 
 Env:
-  GEMINI_API_KEY — required for live model calls; without it, /api/chat
-                   returns a friendly "auth" error (UI still works).
-  PORT          — defaults to 3000
+  MINIMAX_API_KEY  — required for live model calls; without it, /api/chat
+                    returns a friendly "auth" error (UI still works).
+  MINIMAX_BASE_URL — optional, defaults to https://api.minimaxi.com/v1
+                     (use https://api.minimax.cn/v1 for mainland China)
+  PORT             — defaults to 3000
 
 Run:
-  python3.12 live-server.py
+  MINIMAX_API_KEY=... python3.12 live-server.py
 """
 
 import hashlib
@@ -39,7 +41,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 PORT = int(os.environ.get("PORT", "3000"))
-API_KEY = os.environ.get("GEMINI_API_KEY", "")
+API_KEY = os.environ.get("MINIMAX_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+BASE_URL = os.environ.get("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1")
+MODEL = os.environ.get("MINIMAX_MODEL", "MiniMax-M3")
 
 # ---------- Source snippets (the "RAG corpus") ----------
 SOURCES = [
@@ -193,19 +197,19 @@ _gemini_lock = threading.Lock()
 def classify_error(e):
     raw = str(e).lower() if e else ""
     detail = str(e) if e else ""
-    if any(k in raw for k in ["api key", "unauthenticated", "401", "403", "api_key_invalid", "permission_denied"]):
+    if any(k in raw for k in ["api key", "unauthorized", "401", "403", "invalid_api_key", "permission_denied", "authentication"]):
         return {"bucket": "auth",
-                "message": "Your Gemini API key is missing, invalid, or lacks permission. Update `GEMINI_API_KEY` and try again.",
+                "message": "Your MiniMax API key is missing, invalid, or lacks permission. Update `MINIMAX_API_KEY` and try again.",
                 "detail": detail}
-    if any(k in raw for k in ["rate limit", "429", "quota", "resource_exhausted"]):
+    if any(k in raw for k in ["rate limit", "429", "quota", "resource_exhausted", "too many requests"]):
         return {"bucket": "rate_limit",
-                "message": "You've hit the Gemini API quota or rate limit. Please wait a minute and try again.",
+                "message": "You've hit the MiniMax API quota or rate limit. Please wait a minute and try again.",
                 "detail": detail}
-    if any(k in raw for k in ["connection", "timeout", "network", "unreachable", "dns", "econn"]):
+    if any(k in raw for k in ["connection", "timeout", "network", "unreachable", "dns", "econn", "enotfound", "fetch failed"]):
         return {"bucket": "network",
                 "message": "Couldn't reach the AI service. Check your internet connection and try again.",
                 "detail": detail}
-    if any(k in raw for k in ["safety", "blocked", "recitation", "content_filter"]):
+    if any(k in raw for k in ["safety", "blocked", "content_filter", "policy"]):
         return {"bucket": "safety",
                 "message": "The AI couldn't safely answer that request. Try rephrasing your question.",
                 "detail": detail}
@@ -227,7 +231,7 @@ def build_prompt(history, user_question):
     return f"{sys_prompt}{history_block}\n\nTRADER QUESTION:\n{user_question}"
 
 
-def get_gemini():
+def get_minimax():
     global _gemini
     if _gemini is not None:
         return _gemini
@@ -235,8 +239,8 @@ def get_gemini():
         if _gemini is None:
             if not API_KEY or API_KEY == "PASTE_YOUR_KEY_HERE":
                 return None
-            from google import genai
-            _gemini = genai.Client(api_key=API_KEY)
+            from openai import OpenAI
+            _gemini = OpenAI(api_key=API_KEY, base_url=BASE_URL)
         return _gemini
 
 
@@ -604,10 +608,40 @@ footer.disclaimer { padding: 10px 16px; border-top: 1px solid var(--border); bac
     <div class="actions">
       <span class="badge" id="badge">__SRC_COUNT__ sources</span>
       <span class="user-pill" id="user-pill">…</span>
+      <button class="icon-btn" id="settings-btn" type="button" aria-label="Open settings" title="Settings" data-testid="settings-btn">⚙️</button>
       <button class="icon-btn" id="clear" type="button">🗑️ Clear</button>
       <a href="/" class="icon-btn" style="text-decoration:none;">Home</a>
     </div>
   </header>
+
+  <!-- Settings panel (hidden by default; toggled by ⚙️) -->
+  <div id="settings-panel" data-testid="settings-panel" style="display:none; position:absolute; top:64px; right:16px; width:360px; background:white; border:1px solid #e7e5e4; border-radius:12px; padding:16px; box-shadow:0 10px 25px rgba(0,0,0,0.08); z-index:50;">
+    <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+      <strong style="font-size:14px;">⚙️ Settings</strong>
+      <button type="button" id="settings-close" style="background:transparent; border:none; cursor:pointer; font-size:18px; line-height:1; color:#78716c;" aria-label="Close settings">✕</button>
+    </div>
+    <label style="display:block; font-size:12px; font-weight:500; margin-bottom:4px; color:#44403c;">
+      MiniMax API key <span style="font-weight:400; color:#78716c;">(stored in this browser only)</span>
+    </label>
+    <input type="password" id="settings-key" data-testid="settings-key" placeholder="eyJ... or sk-..." autocomplete="off" spellcheck="false"
+      style="width:100%; padding:8px 10px; border:1px solid #d6d3d1; border-radius:8px; font-size:13px; font-family:ui-monospace,monospace; margin-bottom:12px;" />
+    <label style="display:block; font-size:12px; font-weight:500; margin-bottom:4px; color:#44403c;">API base URL</label>
+    <select id="settings-base-url" data-testid="settings-base-url"
+      style="width:100%; padding:8px 10px; border:1px solid #d6d3d1; border-radius:8px; font-size:13px; margin-bottom:12px;">
+      <option value="https://api.minimaxi.com/v1">api.minimaxi.com (international)</option>
+      <option value="https://api.minimax.cn/v1">api.minimax.cn (mainland China)</option>
+    </select>
+    <div style="display:flex; gap:8px;">
+      <button type="button" id="settings-save" data-testid="settings-save"
+        style="flex:1; padding:8px 12px; background:#059669; color:white; border:none; border-radius:8px; font-size:13px; font-weight:500; cursor:pointer;">Save</button>
+      <button type="button" id="settings-clear" data-testid="settings-clear"
+        style="padding:8px 12px; background:white; color:#44403c; border:1px solid #e7e5e4; border-radius:8px; font-size:13px; cursor:pointer;">Clear</button>
+    </div>
+    <p style="margin-top:8px; margin-bottom:0; font-size:11px; color:#a8a29e; line-height:1.4;">
+      Your key is only stored in this browser&apos;s localStorage and sent with each chat request.
+      The server uses it directly to call MiniMax — never logged.
+    </p>
+  </div>
 
   <div class="scroll" id="scroll">
     <div class="container-msg" id="container">
@@ -748,15 +782,22 @@ async function sendMessage(text) {
   const q = (text || "").trim();
   if (!q || pending) return;
   clearError();
+
+  // Pick up any user-supplied MiniMax key from settings panel
+  const userKey = localStorage.getItem("tradepass.minimaxKey") || "";
+  const userBase = localStorage.getItem("tradepass.minimaxBaseUrl") || "";
   messages.push({ id: "u_" + Date.now(), role: "user", content: q });
   input.value = "";
   pending = true;
   send.disabled = true;
   render();
   try {
+    const body = { question: q };
+    if (userKey) body.apiKey = userKey;
+    if (userBase) body.baseUrl = userBase;
     const r = await authedFetch("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ question: q }),
+      body: JSON.stringify(body),
     });
     const j = await r.json();
     if (j.ok) {
@@ -788,6 +829,34 @@ clear.onclick = async () => {
   await authedFetch("/api/conversation", { method: "DELETE" });
   render();
 };
+
+// ----- Settings panel wiring -----
+const settingsBtn = document.getElementById("settings-btn");
+const settingsPanel = document.getElementById("settings-panel");
+const settingsKey = document.getElementById("settings-key");
+const settingsBase = document.getElementById("settings-base-url");
+const settingsClose = document.getElementById("settings-close");
+const settingsSave = document.getElementById("settings-save");
+const settingsClear = document.getElementById("settings-clear");
+
+settingsBtn.onclick = () => {
+  settingsKey.value = localStorage.getItem("tradepass.minimaxKey") || "";
+  settingsBase.value = localStorage.getItem("tradepass.minimaxBaseUrl") || "https://api.minimaxi.com/v1";
+  settingsPanel.style.display = "block";
+};
+settingsClose.onclick = () => { settingsPanel.style.display = "none"; };
+settingsSave.onclick = () => {
+  localStorage.setItem("tradepass.minimaxKey", settingsKey.value.trim());
+  localStorage.setItem("tradepass.minimaxBaseUrl", settingsBase.value.trim() || "https://api.minimaxi.com/v1");
+  settingsPanel.style.display = "none";
+};
+settingsClear.onclick = () => {
+  localStorage.removeItem("tradepass.minimaxKey");
+  localStorage.removeItem("tradepass.minimaxBaseUrl");
+  settingsKey.value = "";
+  settingsPanel.style.display = "none";
+};
+
 restore();
 </script>
 </body>
@@ -907,6 +976,9 @@ class Handler(BaseHTTPRequestHandler):
         if data is None:
             return self._send_json(400, {"ok": False, "error": {"bucket": "unknown", "message": "Invalid JSON", "detail": ""}})
         question = (data.get("question") or "").strip()
+        user_api_key = (data.get("apiKey") or "").strip()
+        user_base_url = (data.get("baseUrl") or "").strip()
+
         if not question:
             return self._send_json(200, {"ok": False, "error": {
                 "bucket": "unknown",
@@ -914,24 +986,34 @@ class Handler(BaseHTTPRequestHandler):
                 "detail": "empty question",
             }})
 
-        client = get_gemini()
-        if client is None:
+        # Use user-provided key if supplied (per-browser via the settings panel);
+        # otherwise fall back to env. This is the "hidden place" — each browser
+        # supplies its own key without server restart.
+        effective_key = user_api_key or API_KEY
+        effective_base = user_base_url or BASE_URL
+
+        if not effective_key or effective_key == "PASTE_YOUR_KEY_HERE":
             return self._send_json(200, {"ok": False, "error": {
                 "bucket": "auth",
-                "message": "Your Gemini API key is not configured on the server. Set GEMINI_API_KEY and restart.",
-                "detail": "GEMINI_API_KEY missing",
+                "message": "No MiniMax API key configured. Open the gear icon (top-right of the chat) to paste your key.",
+                "detail": "MINIMAX_API_KEY missing (neither env nor user-provided)",
             }})
+
+        from openai import OpenAI
+        client = OpenAI(api_key=effective_key, base_url=effective_base)
 
         history = get_conversation(email)
         append_message(email, "user", question)
 
         try:
             prompt = build_prompt(history, question)
-            resp = client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=prompt,
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=1024,
             )
-            text = (resp.text or "").strip()
+            text = (resp.choices[0].message.content or "").strip()
             if not text:
                 raise RuntimeError("empty model response")
             append_message(email, "assistant", text)
@@ -947,7 +1029,7 @@ class Handler(BaseHTTPRequestHandler):
                 with CONV_LOCK:
                     USER_CONVERSATIONS[email] = conv
             err = classify_error(e)
-            sys.stderr.write(f"[TradePass] Gemini error: {e}\n")
+            sys.stderr.write(f"[TradePass] MiniMax error: {e}\n")
             return self._send_json(200, {"ok": False, "error": err})
 
 
@@ -955,7 +1037,9 @@ def main():
     has_key = bool(API_KEY) and API_KEY != "PASTE_YOUR_KEY_HERE"
     print(f"TradePass live server (Python)")
     print(f"   URL:    http://localhost:{PORT}")
-    print(f"   Gemini: {'OK loaded' if has_key else 'NOT SET (chat will return auth error, UI still works)'}")
+    print(f"   MiniMax: {'OK loaded' if has_key else 'NOT SET (chat will return auth error, UI still works)'}")
+    print(f"   Base URL: {BASE_URL}")
+    print(f"   Model:    {MODEL}")
     print(f"   Sources: {len(SOURCES)}")
     print(f"   Press Ctrl+C to stop.")
     httpd = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)

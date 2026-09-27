@@ -21,9 +21,9 @@ export const runtime = "nodejs"; // libsql native binding
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request): Promise<NextResponse<ChatResponse>> {
-  let body: ChatRequest;
+  let body: ChatRequest & { apiKey?: string; baseUrl?: string };
   try {
-    body = (await req.json()) as ChatRequest;
+    body = (await req.json()) as ChatRequest & { apiKey?: string; baseUrl?: string };
   } catch {
     return NextResponse.json(
       {
@@ -79,7 +79,10 @@ export async function POST(req: Request): Promise<NextResponse<ChatResponse>> {
 
     await appendMessage(sessionId, "user", question);
 
-    const result = await generateAnswer(sources, historyTurns, question);
+    const result = await generateAnswer(sources, historyTurns, question, {
+      apiKey: body.apiKey,
+      baseUrl: body.baseUrl,
+    });
 
     if (!result.ok) {
       // Don't persist a failed assistant reply — keep the DB clean.
