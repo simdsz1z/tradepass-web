@@ -14,7 +14,7 @@
 
 import { NextResponse } from "next/server";
 import { appendMessage, getAllSources, getSessionMessages } from "@/lib/db";
-import { generateAnswer } from "@/lib/gemini";
+import { generateAnswer } from "@/lib/llm";
 import type { ChatRequest, ChatResponse } from "@/lib/types";
 
 export const runtime = "nodejs"; // libsql native binding
