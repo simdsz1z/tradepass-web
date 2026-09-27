@@ -15,11 +15,21 @@ import OpenAI from "openai";
 
 const MODEL_DEFAULT = "MiniMax-M3";
 
-function getClient(): OpenAI | null {
-  const apiKey = process.env.MINIMAX_API_KEY;
+export type GenerateOpts = {
+  apiKey?: string;
+  baseUrl?: string;
+};
+
+function getClient(opts: GenerateOpts = {}): OpenAI | null {
+  const apiKey =
+    opts.apiKey?.trim() ||
+    process.env.MINIMAX_API_KEY ||
+    process.env.OPENAI_API_KEY;
   if (!apiKey || apiKey === "PASTE_YOUR_KEY_HERE") return null;
   const baseURL =
-    process.env.MINIMAX_BASE_URL ?? "https://api.minimaxi.com/v1";
+    opts.baseUrl?.trim() ||
+    process.env.MINIMAX_BASE_URL ||
+    "https://api.minimaxi.com/v1";
   return new OpenAI({ apiKey, baseURL });
 }
 
@@ -91,8 +101,9 @@ export async function generateAnswer(
   sources: Array<{ id: string; title: string; text: string }>,
   history: HistoryTurn[],
   userQuestion: string,
+  opts: GenerateOpts = {},
 ): Promise<{ ok: true; text: string } | { ok: false; error: LLMError }> {
-  const client = getClient();
+  const client = getClient(opts);
   if (!client) {
     return {
       ok: false,
