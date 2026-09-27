@@ -37,13 +37,25 @@ import secrets
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 PORT = int(os.environ.get("PORT", "3000"))
 API_KEY = os.environ.get("MINIMAX_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
-BASE_URL = os.environ.get("MINIMAX_BASE_URL", "https://api.minimaxi.com/v1")
+# Both `https://api.minimaxi.com/v1` and `https://api.minimaxi.com` are accepted;
+# we strip any trailing `/v1` before appending `/v1/text/chatcompletion_v2`.
+BASE_URL = os.environ.get("MINIMAX_BASE_URL", "https://api.minimaxi.com")
 MODEL = os.environ.get("MINIMAX_MODEL", "MiniMax-M3")
+
+
+def _native_base() -> str:
+    """Return the MiniMax base URL *without* any trailing /v1."""
+    u = BASE_URL.rstrip("/")
+    if u.endswith("/v1"):
+        u = u[:-3]
+    return u
 
 # ---------- Source snippets (the "RAG corpus") ----------
 SOURCES = [
@@ -634,12 +646,19 @@ footer.disclaimer { padding: 10px 16px; border-top: 1px solid var(--border); bac
     <div style="display:flex; gap:8px;">
       <button type="button" id="settings-save" data-testid="settings-save"
         style="flex:1; padding:8px 12px; background:#059669; color:white; border:none; border-radius:8px; font-size:13px; font-weight:500; cursor:pointer;">Save</button>
+      <button type="button" id="settings-test" data-testid="settings-test"
+        style="padding:8px 12px; background:white; color:#44403c; border:1px solid #e7e5e4; border-radius:8px; font-size:13px; cursor:pointer;">Test</button>
       <button type="button" id="settings-clear" data-testid="settings-clear"
         style="padding:8px 12px; background:white; color:#44403c; border:1px solid #e7e5e4; border-radius:8px; font-size:13px; cursor:pointer;">Clear</button>
     </div>
+    <div id="settings-result" data-testid="settings-result" style="margin-top:10px; font-size:11px; line-height:1.4; display:none;"></div>
     <p style="margin-top:8px; margin-bottom:0; font-size:11px; color:#a8a29e; line-height:1.4;">
       Your key is only stored in this browser&apos;s localStorage and sent with each chat request.
       The server uses it directly to call MiniMax — never logged.
+    </p>
+    <p style="margin-top:8px; margin-bottom:0; font-size:11px; color:#a8a29e; line-height:1.4;">
+      Need a MiniMax key? <a href="https://platform.minimaxi.io/user-center/basic-information/interface-key" target="_blank" rel="noopener" style="color:#059669;">Get one here</a>.
+      MiniMax keys typically start with <code style="background:#f5f5f4; padding:1px 5px; border-radius:4px;">eyJ</code>, not <code style="background:#f5f5f4; padding:1px 5px; border-radius:4px;">sk-</code> (that&apos;s OpenAI&apos;s format).
     </p>
   </div>
 
@@ -856,6 +875,47 @@ settingsClear.onclick = () => {
   settingsKey.value = "";
   settingsPanel.style.display = "none";
 };
+const settingsTest = document.getElementById("settings-test");
+const settingsResult = document.getElementById("settings-result");
+settingsTest.onclick = async () => {
+  // First save whatever's currently in the inputs
+  localStorage.setItem("tradepass.minimaxKey", settingsKey.value.trim());
+  localStorage.setItem("tradepass.minimaxBaseUrl", settingsBase.value.trim() || "https://api.minimaxi.com/v1");
+  settingsResult.style.display = "block";
+  settingsResult.style.padding = "8px 10px";
+  settingsResult.style.borderRadius = "8px";
+  settingsResult.style.background = "#f5f5f4";
+  settingsResult.style.color = "#44403c";
+  settingsResult.textContent = "Testing…";
+  try {
+    const token = localStorage.getItem("tradepass.token");
+    if (!token) {
+      settingsResult.textContent = "Sign in first (Settings panel only works for logged-in users).";
+      settingsResult.style.background = "#fef2f2";
+      settingsResult.style.color = "#991b1b";
+      return;
+    }
+    const r = await fetch("/api/test-key", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+      body: JSON.stringify({}),
+    });
+    const j = await r.json();
+    if (j.ok) {
+      settingsResult.style.background = "#ecfdf5";
+      settingsResult.style.color = "#065f46";
+      settingsResult.innerHTML = `✓ Key works! Model: <code style="background:white; padding:1px 5px; border-radius:4px;">${j.model}</code><br/>Reply: "${j.reply}"`;
+    } else {
+      settingsResult.style.background = "#fef2f2";
+      settingsResult.style.color = "#991b1b";
+      settingsResult.innerHTML = `✗ Key rejected.<br/><code style="background:white; padding:2px 6px; border-radius:4px; font-size:10px; display:block; margin-top:4px;">${j.detail}</code>`;
+    }
+  } catch (e) {
+    settingsResult.textContent = "Test failed: " + e.message;
+    settingsResult.style.background = "#fef2f2";
+    settingsResult.style.color = "#991b1b";
+  }
+};
 
 restore();
 </script>
@@ -941,6 +1001,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(401, {"error": "unauthorized"})
             return self._handle_chat(u["email"])
 
+        if path == "/api/test-key":
+            u = auth_user(self)
+            if not u:
+                return self._send_json(401, {"error": "unauthorized"})
+            return self._handle_test_key()
+
         return self._send_json(404, {"error": "not found"})
 
     def do_DELETE(self):
@@ -971,6 +1037,61 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as e:
             return self._send_json(400, {"error": str(e)})
 
+    def _handle_test_key(self):
+        """Test whether the user's MiniMax API key works — makes a 5-token call."""
+        data = self._read_json() or {}
+        user_api_key = (data.get("apiKey") or "").strip()
+        user_base_url = (data.get("baseUrl") or "").strip()
+        effective_key = user_api_key or API_KEY
+        effective_base = user_base_url or BASE_URL
+
+        if not effective_key or effective_key == "PASTE_YOUR_KEY_HERE":
+            return self._send_json(200, {"ok": False, "bucket": "auth",
+                "detail": "No key configured. Paste one in the settings panel and click Save first."})
+
+        try:
+            base = (user_base_url or effective_base).rstrip("/")
+            if base.endswith("/v1"):
+                base = base[:-3]
+            url = base + "/v1/text/chatcompletion_v2"
+            req = urllib.request.Request(
+                url,
+                data=json.dumps({
+                    "model": MODEL,
+                    "messages": [{"role": "user", "name": "Trader", "content": "Reply with the single word: pong"}],
+                    "temperature": 0,
+                    "max_completion_tokens": 10,
+                }).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {effective_key}",
+                    "Accept": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode("utf-8")
+            j = json.loads(raw) if raw else {}
+            if isinstance(j, dict):
+                base = j.get("base_resp") or {}
+                if base.get("status_code") not in (0, None):
+                    raise RuntimeError(f"{base.get('status_code')}: {base.get('status_msg')}")
+                text = ((j.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                        or j.get("reply") or j.get("text") or "").strip()
+            else:
+                text = ""
+            return self._send_json(200, {"ok": True, "model": MODEL, "reply": text})
+        except urllib.error.HTTPError as herr:
+            body = ""
+            try:
+                body = herr.read().decode("utf-8", errors="replace")[:300]
+            except Exception:
+                pass
+            return self._send_json(200, {"ok": False, "bucket": "auth",
+                "detail": f"HTTP {herr.code}: {body or herr.reason}"})
+        except Exception as e:
+            return self._send_json(200, {"ok": False, "bucket": "auth", "detail": str(e)[:500]})
+
     def _handle_chat(self, email):
         data = self._read_json()
         if data is None:
@@ -1000,22 +1121,67 @@ class Handler(BaseHTTPRequestHandler):
             }})
 
         from openai import OpenAI
-        client = OpenAI(api_key=effective_key, base_url=effective_base)
-
         history = get_conversation(email)
         append_message(email, "user", question)
 
         try:
             prompt = build_prompt(history, question)
-            resp = client.chat.completions.create(
-                model=MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                max_tokens=1024,
+            # MiniMax native endpoint — works with subscription keys where the
+            # OpenAI-compatible /v1/chat/completions fails with 1004.
+            base = effective_base.rstrip("/")
+            if base.endswith("/v1"):
+                base = base[:-3]
+            url = base + "/v1/text/chatcompletion_v2"
+            req_body = json.dumps({
+                "model": MODEL,
+                "messages": [
+                    {"role": "system", "name": "TradePass",
+                     "content": "You are TradePass, an AI assistant that helps small traders in Africa understand what documents they need and whether their product likely qualifies for AfCFTA preferential tariffs. Answer in English."},
+                    {"role": "user", "name": "Trader", "content": prompt},
+                ],
+                "temperature": 0.3,
+                "top_p": 0.9,
+                "max_completion_tokens": 1024,
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                url,
+                data=req_body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {effective_key}",
+                    "Accept": "application/json",
+                },
+                method="POST",
             )
-            text = (resp.choices[0].message.content or "").strip()
+            try:
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    raw = resp.read().decode("utf-8")
+            except urllib.error.HTTPError as herr:
+                body = ""
+                try:
+                    body = herr.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                raise RuntimeError(f"HTTP {herr.code} {herr.reason}: {body[:300]}")
+
+            j = json.loads(raw) if raw else {}
+            if isinstance(j, dict):
+                base_resp = j.get("base_resp") or {}
+                if base_resp.get("status_code") not in (0, None) and base_resp.get("status_msg"):
+                    raise RuntimeError(
+                        f"MiniMax error {base_resp.get('status_code')}: {base_resp.get('status_msg')}"
+                    )
+                text = (
+                    (j.get("choices") or [{}])[0].get("message", {}).get("content", "")
+                    or j.get("reply")
+                    or j.get("text")
+                    or ""
+                )
+            else:
+                text = ""
+            text = (text or "").strip()
             if not text:
-                raise RuntimeError("empty model response")
+                raise RuntimeError(f"empty model response — raw: {raw[:300]}")
             append_message(email, "assistant", text)
             return self._send_json(200, {
                 "ok": True,

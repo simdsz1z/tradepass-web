@@ -1,37 +1,48 @@
 /**
- * LLM integration — MiniMax (OpenAI-compatible).
+ * LLM integration — MiniMax (native endpoint).
  *
- * MiniMax exposes an OpenAI-compatible Chat Completions API at
- *   https://api.minimaxi.com/v1   (international)
- *   https://api.minimax.cn/v1     (mainland China)
+ * IMPORTANT: This uses MiniMax's NATIVE API at /v1/text/chatcompletion_v2,
+ * not the OpenAI-compatible /v1/chat/completions endpoint.
  *
- * Default model: MiniMax-M3 (1M context, multimodal, agent-friendly).
- * Swap to MiniMax-M2.7 / M2.5 / M2 via MINIMAX_MODEL env var.
+ * Why native? The OpenAI-compatible endpoint has a known bug where
+ * subscription / Token Plan keys fail with 1004 "not authorized" (see
+ * litellm/litellm#24483). The native endpoint accepts all key types.
  *
- * This replaces the earlier `@google/genai` Gemini integration.
+ * Native request:
+ *   POST {baseUrl}/v1/text/chatcompletion_v2
+ *   Authorization: Bearer {apiKey}
+ *   { "model": "MiniMax-M3", "messages": [...], "temperature": ..., ... }
+ *
+ * Native response also wraps everything in a "base_resp" envelope, so we
+ * extract `.choices[0].message.content` (the OpenAI-style body) and
+ * fall back to checking `.reply` or `.text` depending on what's there.
  */
-
-import OpenAI from "openai";
-
-const MODEL_DEFAULT = "MiniMax-M3";
 
 export type GenerateOpts = {
   apiKey?: string;
   baseUrl?: string;
+  // Allow forcing OpenAI-compat mode for testing (not recommended)
+  useOpenAICompat?: boolean;
 };
 
-function getClient(opts: GenerateOpts = {}): OpenAI | null {
-  const apiKey =
+function pickApiKey(opts: GenerateOpts): string | null {
+  const k =
     opts.apiKey?.trim() ||
     process.env.MINIMAX_API_KEY ||
     process.env.OPENAI_API_KEY;
-  if (!apiKey || apiKey === "PASTE_YOUR_KEY_HERE") return null;
-  const baseURL =
+  if (!k || k === "PASTE_YOUR_KEY_HERE") return null;
+  return k;
+}
+
+function pickBaseUrl(opts: GenerateOpts): string {
+  return (
     opts.baseUrl?.trim() ||
     process.env.MINIMAX_BASE_URL ||
-    "https://api.minimaxi.com/v1";
-  return new OpenAI({ apiKey, baseURL });
+    "https://api.minimaxi.com"
+  );
 }
+
+const MODEL_DEFAULT = "MiniMax-M3";
 
 export const MODEL =
   process.env.MINIMAX_MODEL ?? MODEL_DEFAULT;
@@ -96,6 +107,76 @@ export function buildPrompt(
   return `${sys}${historyBlock}\n\nTRADER QUESTION:\n${userQuestion}`;
 }
 
+async function callNative(opts: {
+  apiKey: string;
+  baseUrl: string;
+  prompt: string;
+}): Promise<string> {
+  // MiniMax native endpoint: POST {baseUrl}/v1/text/chatcompletion_v2
+  const url = `${opts.baseUrl.replace(/\/$/, "")}/v1/text/chatcompletion_v2`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${opts.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: MODEL,
+      messages: [
+        {
+          role: "system",
+          name: "TradePass",
+          content:
+            "You are TradePass, an AI assistant that helps small traders in Africa understand what documents they need and whether their product likely qualifies for AfCFTA preferential tariffs. Answer in English.",
+        },
+        { role: "user", name: "Trader", content: opts.prompt },
+      ],
+      temperature: 0.3,
+      top_p: 0.9,
+      max_completion_tokens: 1024,
+    }),
+  });
+  const raw = await res.text();
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} ${res.statusText} — ${raw}`);
+  }
+  const j = raw ? JSON.parse(raw) : {};
+  // MiniMax native response: { choices: [{ message: { content } }], base_resp: { status_code, status_msg } }
+  if (j.base_resp && j.base_resp.status_code && j.base_resp.status_code !== 0) {
+    throw new Error(
+      `MiniMax error ${j.base_resp.status_code}: ${j.base_resp.status_msg || "unknown"}`,
+    );
+  }
+  const text =
+    j?.choices?.[0]?.message?.content ??
+    j?.reply ??
+    j?.text ??
+    "";
+  return String(text).trim();
+}
+
+async function callOpenAICompat(opts: {
+  apiKey: string;
+  baseUrl: string;
+  prompt: string;
+}): Promise<string> {
+  // Fallback: OpenAI SDK against the OpenAI-compatible endpoint.
+  // Doesn't work for subscription keys on MiniMax, but kept for users
+  // with PAYG keys or other OpenAI-compatible providers.
+  const OpenAI = (await import("openai")).default;
+  const client = new OpenAI({
+    apiKey: opts.apiKey,
+    baseURL: `${opts.baseUrl.replace(/\/$/, "")}/v1`,
+  });
+  const res = await client.chat.completions.create({
+    model: MODEL,
+    messages: [{ role: "user", content: opts.prompt }],
+    temperature: 0.3,
+    max_tokens: 1024,
+  });
+  return (res.choices?.[0]?.message?.content ?? "").trim();
+}
+
 /** Run the model. Returns the text or a categorised error. */
 export async function generateAnswer(
   sources: Array<{ id: string; title: string; text: string }>,
@@ -103,29 +184,26 @@ export async function generateAnswer(
   userQuestion: string,
   opts: GenerateOpts = {},
 ): Promise<{ ok: true; text: string } | { ok: false; error: LLMError }> {
-  const client = getClient(opts);
-  if (!client) {
+  const apiKey = pickApiKey(opts);
+  if (!apiKey) {
     return {
       ok: false,
       error: {
         bucket: "auth",
         message:
-          "Your MiniMax API key is not configured. Set the `MINIMAX_API_KEY` environment variable and redeploy.",
-        detail: "MINIMAX_API_KEY missing or placeholder.",
+          "Your MiniMax API key is not configured. Set the `MINIMAX_API_KEY` environment variable OR paste a key via the ⚙️ Settings panel in the chat.",
+        detail: "no API key resolved",
       },
     };
   }
 
+  const baseUrl = pickBaseUrl(opts);
   const prompt = buildPrompt(sources, history, userQuestion);
 
   try {
-    const response = await client.chat.completions.create({
-      model: MODEL,
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.3,
-      max_tokens: 1024,
-    });
-    const text = response.choices?.[0]?.message?.content ?? "";
+    const text = opts.useOpenAICompat
+      ? await callOpenAICompat({ apiKey, baseUrl, prompt })
+      : await callNative({ apiKey, baseUrl, prompt });
     if (!text) {
       return {
         ok: false,
@@ -133,7 +211,7 @@ export async function generateAnswer(
           bucket: "unknown",
           message:
             "The model returned an empty response. Please try again or rephrase your question.",
-          detail: "empty response.choices[0].message.content",
+          detail: "empty response.content",
         },
       };
     }
@@ -158,12 +236,14 @@ export function classifyError(e: unknown): LLMError {
     raw.includes("403") ||
     raw.includes("invalid_api_key") ||
     raw.includes("permission_denied") ||
-    raw.includes("authentication")
+    raw.includes("authentication") ||
+    raw.includes("1004") ||
+    raw.includes("not authorized")
   ) {
     return {
       bucket: "auth",
       message:
-        "Your MiniMax API key is missing, invalid, or lacks permission. Update `MINIMAX_API_KEY` and try again.",
+        "Your MiniMax API key is missing, invalid, or not authorized for this endpoint. Open the ⚙️ Settings panel to paste a fresh key, then click 🧪 Test to see MiniMax's exact error.",
       detail,
     };
   }

@@ -82,6 +82,7 @@ export async function POST(req: Request): Promise<NextResponse<ChatResponse>> {
     const result = await generateAnswer(sources, historyTurns, question, {
       apiKey: body.apiKey,
       baseUrl: body.baseUrl,
+      useOpenAICompat: false, // subscription keys need native endpoint
     });
 
     if (!result.ok) {
